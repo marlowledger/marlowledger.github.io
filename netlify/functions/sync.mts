@@ -30,7 +30,7 @@ function storage(): BlobStorage {
 
 export default async (req: Request): Promise<Response> => {
   // Only the published app may use this relay.
-  const allowed = (process.env.SYNC_ALLOWED_ORIGINS ?? 'https://khalilsuccesslines-arch.github.io').split(',').map((s) => s.trim()).filter(Boolean);
+  const allowed = (process.env.SYNC_ALLOWED_ORIGINS ?? 'https://marlowledger.github.io').split(',').map((s) => s.trim()).filter(Boolean);
   try {
     return await handleSync(req, storage(), { allowedOrigins: allowed, verifyLicense });
   } catch (e) {
