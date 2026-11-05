@@ -24,6 +24,22 @@ const SPACE_RE = /^[0-9A-HJKMNP-TV-Z]{20}$/;
 const TOKEN_RE = /^[0-9a-f]{64}$/;
 const BUNDLE_RE = /^(log|snap)\/\d{15}-[a-z0-9]{8}-\d{1,4}$/;
 const BLOB_ID_RE = /^[A-Za-z0-9_-]{4,80}$/;
+const PAIR_CODE_RE = /^\d{6}$/;
+const PUB_RE = /^[A-Za-z0-9_-]{80,100}$/; // a P-256 public key, raw, base64url
+const INBOX_RE = /^[0-9a-f]{48}$/;
+export const PAIR_TTL = 10 * 60_000;
+
+interface PairSlot { a: string; b?: string; msg?: string; exp: number; space: string }
+async function readPair(storage: BlobStorage, code: string, now: number): Promise<PairSlot | null> {
+  const v = await storage.get(`pair/${code}`);
+  if (!v) return null;
+  try {
+    const slot = JSON.parse(new TextDecoder().decode(v)) as PairSlot;
+    if (slot.exp > now) return slot;
+  } catch { /* fall through */ }
+  await storage.delete(`pair/${code}`);
+  return null;
+}
 
 function headers(origin: string | null, allowed: string[]): Record<string, string> {
   const allow = allowed.includes('*') ? '*' : origin && allowed.includes(origin) ? origin : allowed[0] ?? '';
@@ -58,6 +74,64 @@ export async function handleSync(req: Request, storage: BlobStorage, opts: { all
   const url = new URL(req.url);
   const q = (k: string) => url.searchParams.get(k) ?? '';
   const op = q('op');
+  const now0 = opts.now ?? Date.now;
+  const ip = req.headers.get('x-nf-client-connection-ip') ?? req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? '';
+  const limited = async (name: string, max: number, windowMs: number): Promise<boolean> => {
+    if (!ip) return false;
+    const rk = `rl/${name}/${(await sha256Hex(ip)).slice(0, 24)}/${Math.floor(now0() / windowMs)}`;
+    const count = Number(text((await storage.get(rk)) ?? new ArrayBuffer(0))) || 0;
+    if (count >= max) return true;
+    await storage.set(rk, String(count + 1));
+    return false;
+  };
+
+  // A second device joining with a 6-digit code: it isn't in the space yet, so no token.
+  if (op === 'pair-join' || op === 'pair-take') {
+    if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+    let b: { code?: string; pub?: string };
+    try { b = JSON.parse(text(await req.arrayBuffer())); } catch { return fail(400, 'bad-json', 'Bad request.'); }
+    const code = String(b.code ?? '');
+    const pub = String(b.pub ?? '');
+    if (!PAIR_CODE_RE.test(code) || !PUB_RE.test(pub)) return fail(400, 'bad-code', 'That code has 6 digits.');
+    if (op === 'pair-join' && await limited('pair', 12, 600_000)) return fail(429, 'slow-down', 'Too many tries. Wait ten minutes and try again.');
+    const slot = await readPair(storage, code, now0());
+    if (!slot) return fail(404, 'no-code', 'That code isn’t active. Check the 6 digits, or make a new code on your other device.');
+    if (op === 'pair-join') {
+      if (slot.b && slot.b !== pub) return fail(409, 'code-used', 'Another device already used that code. Make a new code on your other device.');
+      await storage.set(`pair/${code}`, JSON.stringify({ ...slot, b: pub }));
+      return json(200, { pub: slot.a });
+    }
+    // pair-take: collect the sealed space details once the first device has sent them.
+    if (slot.b !== pub) return fail(403, 'not-yours', 'That code belongs to another device.');
+    if (!slot.msg) return json(200, { waiting: true });
+    await storage.delete(`pair/${code}`);
+    return json(200, { msg: slot.msg });
+  }
+
+  // Apple Pay and Siri: the Shortcuts app posts an entry to a private inbox address.
+  if (op === 'inbox-put') {
+    if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+    const id = q('inbox');
+    if (!INBOX_RE.test(id)) return fail(400, 'bad-inbox', 'That Marlow link isn’t complete.');
+    if (await limited('inbox', 120, 3600_000)) return fail(429, 'slow-down', 'Too many entries at once.');
+    const owner = await storage.get(`inbox/${await sha256Hex(id)}`);
+    if (!owner) return fail(404, 'no-inbox', 'This Marlow link was turned off. Make a new one in Settings, Apple Pay and Siri.');
+    const raw = text(await req.arrayBuffer());
+    if (raw.length > 2000) return fail(413, 'too-big', 'That entry is too large.');
+    let entry: Record<string, unknown>;
+    try { entry = raw.trim().startsWith('{') ? JSON.parse(raw) : { text: raw }; } catch { entry = { text: raw }; }
+    // Keep only short plain fields; the device does the rest.
+    const clean: Record<string, string> = {};
+    for (const k of ['amount', 'merchant', 'name', 'card', 'text', 'date', 'by']) {
+      const v = entry[k] ?? url.searchParams.get(k);
+      if (v !== undefined && v !== null && String(v).trim()) clean[k] = String(v).slice(0, 200);
+    }
+    if (!clean.amount && !clean.text) return fail(400, 'empty', 'Nothing to log: send an amount, or text like “coffee 4.50”.');
+    const key = `v/${text(owner)}/inbox/${String(now0()).padStart(15, '0')}-${rand(8)}`;
+    await storage.set(key, JSON.stringify({ ...clean, at: new Date(now0()).toISOString() }));
+    return json(201, { ok: true, message: 'Sent to Marlow.' });
+  }
+
   const space = q('space');
   if (!SPACE_RE.test(space)) return fail(400, 'bad-space', 'That pairing code isn’t valid.');
   const token = (req.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '');
@@ -208,6 +282,83 @@ export async function handleSync(req: Request, storage: BlobStorage, opts: { all
       let freed = 0;
       for (const k of await storage.list(`${root}blob/${id}/`)) { freed += (await storage.get(k))?.byteLength ?? 0; await storage.delete(k); }
       await addUsage(-freed);
+      return json(200, { ok: true });
+    }
+    case 'pair-open': {
+      // A linked device offers a 6-digit code for 10 minutes, with its half of a key exchange.
+      if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+      let b: { pub?: string };
+      try { b = JSON.parse(text(await req.arrayBuffer())); } catch { return fail(400, 'bad-json', 'Bad request.'); }
+      if (!PUB_RE.test(String(b.pub ?? ''))) return fail(400, 'bad-key', 'Bad request.');
+      if (await limited('pair-open', 20, 3600_000)) return fail(429, 'slow-down', 'Too many codes. Try again in an hour.');
+      for (let i = 0; i < 8; i++) {
+        const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1_000_000).padStart(6, '0');
+        const existing = await readPair(storage, code, now());
+        if (existing) continue;
+        await storage.set(`pair/${code}`, JSON.stringify({ a: b.pub, exp: now() + PAIR_TTL, space }));
+        return json(201, { code, expires: now() + PAIR_TTL });
+      }
+      return fail(503, 'busy', 'Couldn’t make a code just now. Try again.');
+    }
+    case 'pair-wait': {
+      const code = q('code');
+      if (!PAIR_CODE_RE.test(code)) return fail(400, 'bad-code', 'Bad code.');
+      const slot = await readPair(storage, code, now());
+      if (!slot || slot.space !== space) return fail(404, 'no-code', 'That code expired. Make a new one.');
+      return json(200, { pub: slot.b ?? null });
+    }
+    case 'pair-send': {
+      if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+      const code = q('code');
+      let b: { msg?: string };
+      try { b = JSON.parse(text(await req.arrayBuffer())); } catch { return fail(400, 'bad-json', 'Bad request.'); }
+      const slot = PAIR_CODE_RE.test(code) ? await readPair(storage, code, now()) : null;
+      if (!slot || slot.space !== space || !slot.b) return fail(404, 'no-code', 'That code expired. Make a new one.');
+      const msg = String(b.msg ?? '');
+      if (!msg || msg.length > 8000) return fail(400, 'bad-json', 'Bad request.');
+      await storage.set(`pair/${code}`, JSON.stringify({ ...slot, msg }));
+      return json(200, { ok: true });
+    }
+    case 'pair-cancel': {
+      if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+      const code = q('code');
+      const slot = PAIR_CODE_RE.test(code) ? await readPair(storage, code, now()) : null;
+      if (slot && slot.space === space) await storage.delete(`pair/${code}`);
+      return json(200, { ok: true });
+    }
+    case 'inbox-open': {
+      // A private address for the Shortcuts app. Only its hash is stored, pointing at this space.
+      if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+      const old = q('old');
+      if (INBOX_RE.test(old)) await storage.delete(`inbox/${await sha256Hex(old)}`);
+      const id = Array.from(crypto.getRandomValues(new Uint8Array(24)), (x) => x.toString(16).padStart(2, '0')).join('');
+      await storage.set(`inbox/${await sha256Hex(id)}`, space);
+      return json(201, { inbox: id });
+    }
+    case 'inbox-close': {
+      if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+      const id = q('inbox');
+      if (INBOX_RE.test(id)) {
+        const owner = await storage.get(`inbox/${await sha256Hex(id)}`);
+        if (owner && text(owner) === space) await storage.delete(`inbox/${await sha256Hex(id)}`);
+      }
+      return json(200, { ok: true });
+    }
+    case 'inbox-list': {
+      const keys = (await storage.list(`${root}inbox/`)).sort();
+      const items: unknown[] = [];
+      for (const k of keys.slice(0, 200)) {
+        const v = await storage.get(k);
+        if (v) { try { items.push({ key: k.slice(root.length), ...JSON.parse(text(v)) }); } catch { await storage.delete(k); } }
+      }
+      return json(200, { items });
+    }
+    case 'inbox-done': {
+      if (req.method !== 'POST') return fail(405, 'method', 'Use POST.');
+      let keys: string[];
+      try { keys = (JSON.parse(text(await req.arrayBuffer())) as { keys: string[] }).keys; } catch { return fail(400, 'bad-json', 'Bad request.'); }
+      if (!Array.isArray(keys) || keys.length > 200) return fail(400, 'bad-json', 'Bad request.');
+      for (const k of keys) if (/^inbox\/\d{15}-[a-z0-9]{8}$/.test(k)) await storage.delete(root + k);
       return json(200, { ok: true });
     }
     case 'forget': {
